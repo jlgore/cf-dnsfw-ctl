@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -375,10 +376,6 @@ func (m model) createCluster() tea.Msg {
 	return clusterCreatedMsg(cluster)
 }
 
-func timePtr(t time.Time) *time.Time {
-	return &t
-}
-
 func main() {
 	var cfgFile string
 	var config Config
@@ -463,10 +460,30 @@ func runTextOutput(api *cloudflare.API, config *Config) error {
 
 	fmt.Println("Cloudflare DNS Firewall Clusters:")
 	for _, cluster := range clusters {
-		fmt.Printf("- Name: %s (ID: %s)\n", cluster.Name, cluster.ID)
-		fmt.Printf("  Upstream IPs: %v\n", cluster.UpstreamIPs)
-		fmt.Printf("  Min Cache TTL: %d\n", cluster.MinimumCacheTTL)
-		fmt.Printf("  Max Cache TTL: %d\n", cluster.MaximumCacheTTL)
+		detailedCluster, err := getDetailedCluster(api, config, cluster.ID)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("- Name: %s\n", detailedCluster.Name)
+		fmt.Printf("  ID: %s\n", detailedCluster.ID)
+		fmt.Printf("  Upstream IPs: %v\n", detailedCluster.UpstreamIPs)
+		fmt.Printf("  DNS Firewall IPs: %v\n", detailedCluster.DNSFirewallIPs)
+		fmt.Printf("  Min Cache TTL: %d\n", detailedCluster.MinimumCacheTTL)
+		fmt.Printf("  Max Cache TTL: %d\n", detailedCluster.MaximumCacheTTL)
+		fmt.Printf("  Deprecate ANY Requests: %v\n", detailedCluster.DeprecateAnyRequests)
+		fmt.Printf("  Modified On: %s\n", detailedCluster.ModifiedOn)
+
+		analytics, err := getClusterAnalytics(api, config, cluster.ID)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("  Analytics (Last 24 hours):")
+		fmt.Printf("    Query Count: %d\n", *analytics.Totals.QueryCount)
+		fmt.Printf("    Uncached Count: %d\n", *analytics.Totals.UncachedCount)
+		fmt.Printf("    Stale Count: %d\n", *analytics.Totals.StaleCount)
+		fmt.Printf("    Avg Response Time: %.2f\n", *analytics.Totals.ResponseTimeAvg)
 		fmt.Println()
 	}
 
@@ -483,7 +500,30 @@ func runJSONOutput(api *cloudflare.API, config *Config) error {
 		return err
 	}
 
-	jsonData, err := json.MarshalIndent(clusters, "", "  ")
+	type ClusterWithAnalytics struct {
+		cloudflare.DNSFirewallCluster
+		Analytics *cloudflare.DNSFirewallAnalytics `json:"analytics"`
+	}
+
+	detailedClusters := make([]ClusterWithAnalytics, len(clusters))
+	for i, cluster := range clusters {
+		detailedCluster, err := getDetailedCluster(api, config, cluster.ID)
+		if err != nil {
+			return err
+		}
+
+		analytics, err := getClusterAnalytics(api, config, cluster.ID)
+		if err != nil {
+			return err
+		}
+
+		detailedClusters[i] = ClusterWithAnalytics{
+			DNSFirewallCluster: *detailedCluster,
+			Analytics:          &analytics,
+		}
+	}
+
+	jsonData, err := json.MarshalIndent(detailedClusters, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -502,21 +542,98 @@ func runMarkdownOutput(api *cloudflare.API, config *Config) error {
 		return err
 	}
 
+	fmt.Println("# Cloudflare DNS Firewall Clusters")
+	fmt.Println()
+
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"Name", "ID", "Upstream IPs", "Min TTL", "Max TTL"})
+	table.SetHeader([]string{"Name", "ID", "Upstream IPs", "DNS Firewall IPs", "Min TTL", "Max TTL", "Deprecate ANY", "Modified On"})
 	table.SetBorders(tablewriter.Border{Left: true, Top: false, Right: true, Bottom: false})
 	table.SetCenterSeparator("|")
 
 	for _, cluster := range clusters {
+		detailedCluster, err := api.GetDNSFirewallCluster(ctx, rc, cloudflare.GetDNSFirewallClusterParams{ClusterID: cluster.ID})
+		if err != nil {
+			return err
+		}
+
 		table.Append([]string{
-			cluster.Name,
-			cluster.ID,
-			strings.Join(cluster.UpstreamIPs, ", "),
-			fmt.Sprintf("%d", cluster.MinimumCacheTTL),
-			fmt.Sprintf("%d", cluster.MaximumCacheTTL),
+			detailedCluster.Name,
+			detailedCluster.ID,
+			strings.Join(detailedCluster.UpstreamIPs, ", "),
+			strings.Join(detailedCluster.DNSFirewallIPs, ", "),
+			strconv.Itoa(int(detailedCluster.MinimumCacheTTL)),
+			strconv.Itoa(int(detailedCluster.MaximumCacheTTL)),
+			strconv.FormatBool(detailedCluster.DeprecateAnyRequests),
+			detailedCluster.ModifiedOn,
 		})
 	}
 
 	table.Render()
+
+	fmt.Println("\n## Analytics (Last 24 hours)")
+	fmt.Println()
+
+	analyticsTable := tablewriter.NewWriter(os.Stdout)
+	analyticsTable.SetHeader([]string{"Cluster", "Query Count", "Uncached Count", "Stale Count", "Avg Response Time"})
+	analyticsTable.SetBorders(tablewriter.Border{Left: true, Top: false, Right: true, Bottom: false})
+	analyticsTable.SetCenterSeparator("|")
+
+	for _, cluster := range clusters {
+		analytics, err := api.GetDNSFirewallUserAnalytics(ctx, rc, cloudflare.GetDNSFirewallUserAnalyticsParams{
+			ClusterID: cluster.ID,
+			DNSFirewallUserAnalyticsOptions: cloudflare.DNSFirewallUserAnalyticsOptions{
+				Metrics: []string{"queryCount", "uncachedCount", "staleCount", "responseTimeAvg"},
+				Since:   timePtr(time.Now().Add(-24 * time.Hour)),
+				Until:   timePtr(time.Now()),
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		analyticsTable.Append([]string{
+			cluster.Name,
+			strconv.FormatInt(*analytics.Totals.QueryCount, 10),
+			strconv.FormatInt(*analytics.Totals.UncachedCount, 10),
+			strconv.FormatInt(*analytics.Totals.StaleCount, 10),
+			fmt.Sprintf("%.2f", *analytics.Totals.ResponseTimeAvg),
+		})
+	}
+
+	analyticsTable.Render()
+
 	return nil
+}
+
+func getDetailedCluster(api *cloudflare.API, config *Config, clusterID string) (*cloudflare.DNSFirewallCluster, error) {
+	ctx := context.Background()
+	rc := cloudflare.AccountIdentifier(config.AccountID)
+	params := cloudflare.GetDNSFirewallClusterParams{
+		ClusterID: clusterID,
+	}
+
+	return api.GetDNSFirewallCluster(ctx, rc, params)
+}
+
+func getClusterAnalytics(api *cloudflare.API, config *Config, clusterID string) (cloudflare.DNSFirewallAnalytics, error) {
+	ctx := context.Background()
+	rc := cloudflare.AccountIdentifier(config.AccountID)
+	params := cloudflare.GetDNSFirewallUserAnalyticsParams{
+		ClusterID: clusterID,
+		DNSFirewallUserAnalyticsOptions: cloudflare.DNSFirewallUserAnalyticsOptions{
+			Metrics: []string{"queryCount", "uncachedCount", "staleCount", "responseTimeAvg"},
+			Since:   timePtr(time.Now().Add(-24 * time.Hour)),
+			Until:   timePtr(time.Now()),
+		},
+	}
+
+	analytics, err := api.GetDNSFirewallUserAnalytics(ctx, rc, params)
+	if err != nil {
+		fmt.Println(err)
+	}
+	return analytics, nil
+}
+
+func timePtr(t time.Time) *time.Time {
+	return &t
 }
